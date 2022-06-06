@@ -568,7 +568,7 @@ endif
 	xchg	ds:IoctlReadCmds[8*2],si
 	mov	di,offset pVolSize + S2FAC
 	mov	[di],si
-if not	?ONLYBUGFIXES
+ife	?ONLYBUGFIXES
 	; DevStat patch is to advertise new functionality
 	mov	si,offset OurDevStat + S3FAC
 	xchg	ds:IoctlReadCmds[6*2],si
@@ -679,7 +679,7 @@ stage3:
 	assume	ds:driver,ss:driver,fs:driver,gs:driver
 
 pVolSize	dw ?	; pointer to original VolSize function
-if not	?ONLYBUGFIXES
+ife	?ONLYBUGFIXES
 pDevStat	dw ?	; pointer to original DevStat function
 
 OurDevStat	proc near
@@ -701,11 +701,11 @@ OurVolSize	proc near
 	; The same data-access function is called from both LocHead and VolSize
 	; while for VolSize it should be accessing data 8 bytes earlier.
 	; So, temporarily fix up the pointer...
-	sub	badmov[2],8
+	sub	ds:badmov[2],8
 	mov	bx,offset pVolSize + S3FAC
 	mov	bx,[bx]
 	call	bx
-	add	badmov[2],8
+	add	ds:badmov[2],8
 	ret
 OurVolSize	endp
 
