@@ -727,14 +727,13 @@ endif
 
 	; patch the interrupt function to point to Stage 3
 	; change "mov al,es:[si].RqHdr.bCmd" to "call ChkStatus"
-	; TODO: Figure out why this screws up ReadLong!
-; 	mov	si,offset ChkStatus + S3FAC - offset intloadcmd[4]
-; if	?INSERTBKPTS
-; 	mov	ds:intloadcmd[0],0E8CCh
-; else
-; 	mov	ds:intloadcmd[0],0E890h
-; endif
-; 	mov	ds:intloadcmd[2],si
+	mov	si,offset ChkStatus + S3FAC - offset intloadcmd[4]
+if	?INSERTBKPTS
+	mov	ds:intloadcmd[0],0E8CCh
+else
+	mov	ds:intloadcmd[0],0E890h
+endif
+	mov	ds:intloadcmd[2],si
 	; change "mov es:[bx].RqHdr.wStatus,ax" to "call SetStatus"
 	mov	si,offset SetStatus + S3FAC - offset intsavests[4]
 if	?INSERTBKPTS
@@ -872,13 +871,13 @@ ChkStatus	proc near
 	jmp	@@done
 
 @@:
+	cmp	ah,12
+	je	@F
+
+	; if we're here, it's LocHead
 	push	es
 	push	si
 	les	si,dword ptr es:[si].IOCTLRW.wBufOff
-
-	cmp	ah,12
-	je	@F
-	; if we're here, it's LocHead
 	cmp	es:[si].LocHead.bAMode,1
 	pop	si
 	pop	es
@@ -990,6 +989,13 @@ ChkStatus	proc near
 	mov	ax,bp		; get return code
 	bt	ax,0Fh		; set carry if AX & 8000h
 @@:
+	; Restore upper halves of regs to zero, as they were in the interrupt
+	; routine itself!
+	movzx	eax,ax
+	movzx	ebx,bx
+	movzx	ecx,cx
+	movzx	edx,dx
+
 	ret
 ChkStatus	endp
 
@@ -1070,7 +1076,7 @@ OurReadLong	proc near
 	assume	fs:nothing,es:driver
 	mov	cx,sizeof ReadL
 	mov	di,offset sHSGread + S3FAC
-	rep	movsb
+	rep	movsb es:[di],fs:[si]
 
 	mov	si,offset sHSGread + S3FAC
 	; ... and convert its starting point from redbook to HSG
