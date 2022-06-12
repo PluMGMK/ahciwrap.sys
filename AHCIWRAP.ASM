@@ -2,7 +2,8 @@
 	.model	large
 
 ?TESTWITHVBOX	equ 0
-?ONLYBUGFIXES	equ 1
+?ONLYBUGFIXES	equ 0
+?INSERTBKPTS	equ 0
 
 ; Structures
 RqHdr	struc			; DOS driver request header
@@ -32,11 +33,57 @@ IOCTLRW	struc			; IOCTL read/write request
 	_resd3	dd ?		; volume ID = 0 for MSCDEX
 IOCTLRW	ends
 
+ReadL	struc
+	sHdr	RqHdr <?>
+	bAMode	db ?		; addressing mode (RedBook / High Sierra)
+	wBufOff	dw ?
+	wBufSeg	dw ?
+	wSectors dw ?
+	dwStart	dd ?		; first sector
+	bRMode	db ?		; read mode (cooked / raw) - use raw to get 930h
+	bISize	db ?		; interleave size
+	bISkip	db ?		; interleave skip factor
+ReadL	ends
+
+LocHead		struc
+	bCode	db ?		; 1 for read
+	bAMode	db ?		; addressing mode (RedBook / High Sierra)
+	dwLoc	dd ?		; head location returned from driver
+LocHead		ends
+
+sDiskInfo	struc
+	bCode	db ?		; 10 for read
+	bLTrack	db ?
+	bHTrack	db ?
+	dwLOut	dd ?
+sDiskInfo	ends
+
+sTnoInfo	struc
+	bCode	db ?		; 11 for read
+	bTrack	db ?
+	dwStart	dd ?
+	bCtlADR	db ?
+sTnoInfo	ends
+
+QInfo		struc
+	bCode	db ?		; 12 for read
+	bCtlADR	db ?
+	bTrack	db ?
+	bPoint	db ?
+	bMinute	db ?
+	bSecond	db ?
+	bFrame	db ?
+	_resd	db ?		; zero
+	bPMin	db ?
+	bPSec	db ?
+	bPFrame	db ?
+QInfo		ends
+
 ; Code/data positions in Intel's AHCI driver
 num_drives	equ byte ptr 15h
 ; Screwed-up mov instruction
+SwapLBA		equ 20CAh	; function containing the instruction
 badmov		equ word ptr 20CBh
-?BREAKPOINT_BADMOV equ 1
 ; Inappropriate shl instruction
 badshl		equ dword ptr 209Fh
 ; Dwords that are coded as little-endian which should be big-endian
@@ -63,6 +110,23 @@ GeneralCmds	equ word ptr 1536h
 CdromCmds	equ word ptr 1558h
 IoctlReadCmds	equ word ptr 156Ah
 IoctlWriteCmds	equ word ptr 158Ah
+ife	?ONLYBUGFIXES
+; Location to patch in ReadLong function
+ReadLongBadCom	equ word ptr 1EEBh
+; Last four bytes of function to build ATAPI packet
+AtapiPktTail	equ word ptr 2254h
+; Function to send ATAPI command with transfer addx in ES:DI
+send_pkt_addx	equ 20AAh
+; Same thing but without specifying addx (uses internal transfer buf instead)
+send_pkt	equ 208Ah
+; speaking of which...
+XferBuf		equ 0D36h
+; where the interrupt routine checks the status
+intchecksts	equ 1E09h
+; places to inject near calls into the interrupt routine
+intloadcmd	equ word ptr 1DCEh
+intsavests	equ word ptr 1E0Dh
+endif
 ; Endpoints
 end_ahci_res	equ 2AC0h
 end_ahci_init	equ 2F75h
@@ -503,7 +567,7 @@ stage2_init	proc far
 	mov	di,ds:badmov[1]		; get operand of "mov ebx,imm32"
 	mov	ds:badmov[0],1E8Bh	; "mov ebx,dword ptr [imm16]"
 	mov	ds:badmov[2],di		; put in the immediate
-if	?BREAKPOINT_BADMOV
+if	?INSERTBKPTS
 	or	ds:badmov[4],0CCh	; spare byte: make it a breakpoint
 else
 	or	ds:badmov[4],90h	; spare byte: make it a nop
@@ -546,7 +610,7 @@ endif
 	;	mov	ax,bx
 	;	mov	ebx,1Eh
 	;	xor	edx,edx
-if	?BREAKPOINT_BADMOV
+if	?INSERTBKPTS
 	mov	ds:badlockdoor[0],66D889CCh
 else
 	mov	ds:badlockdoor[0],66D88990h
@@ -584,8 +648,7 @@ ife	?ONLYBUGFIXES
 	mov	ds:IoctlReadCmds[10*2],si
 	mov	si,offset TnoInfo + S3FAC
 	mov	ds:IoctlReadCmds[11*2],si
-	mov	si,offset QInfo + S3FAC
-	mov	ds:IoctlReadCmds[12*2],si
+	; QInfo is handled directly in ChkStatus
 	; mov	si,offset SubChanInfo + S3FAC	; UDVD doesn't have this
 	; mov	ds:IoctlReadCmds[13*2],si
 	; mov	si,offset UPCCode + S3FAC	; or this
@@ -597,8 +660,19 @@ ife	?ONLYBUGFIXES
 	; mov	si,offset wDrvBytes + S3FAC	; or this
 	; mov	ds:IoctlWriteCmds[4*2],si
 
-	; TODO: Probably no need to patch function table for ReadLong,
-	; we may be able to just replumb the function itself with inline patches
+	; Patch ReadLong function
+	; If it gets MSF addressing or Raw read mode, it returns "bad command"
+	; (i.e. mov ax,8003h). Replace this with a jump to our own function!
+	mov	ds:ReadLongBadCom[0],0E9h	; jmp rel16
+	mov	si,offset OurReadLong + S3FAC - (ReadLongBadCom+3)
+	mov	ds:ReadLongBadCom[1],si
+	; Patch function to build ATAPI packet
+	; Replace the last three bytes before the RETN with a push instruction,
+	; pushing an address of our own function tail so it jumps there instead!
+	mov	ds:AtapiPktTail[0],68h		; push imm16
+	mov	si,offset OurAtapiPktTail + S3FAC
+	mov	ds:AtapiPktTail[1],si
+
 	mov	si,offset PlayReq + S3FAC
 	mov	ds:CdromCmds[4*2],si
 	mov	si,offset StopPlayReq + S3FAC
@@ -642,6 +716,7 @@ endif
 	jnc	@F
 	movsw
 @@:
+	shr	cx,2
 	rep	movsd
 	pop	es
 	assume	es:nothing
@@ -649,6 +724,26 @@ endif
 	; Intel's driver has stated that it ends at end_ahci_res, but our full
 	; driver actually ends S3LEN later - fix that up with DOS!
 	add	word ptr es:[bx].InitRq.lpEnd,S3LEN
+
+	; patch the interrupt function to point to Stage 3
+	; change "mov al,es:[si].RqHdr.bCmd" to "call ChkStatus"
+	; TODO: Figure out why this screws up ReadLong!
+; 	mov	si,offset ChkStatus + S3FAC - offset intloadcmd[4]
+; if	?INSERTBKPTS
+; 	mov	ds:intloadcmd[0],0E8CCh
+; else
+; 	mov	ds:intloadcmd[0],0E890h
+; endif
+; 	mov	ds:intloadcmd[2],si
+	; change "mov es:[bx].RqHdr.wStatus,ax" to "call SetStatus"
+	mov	si,offset SetStatus + S3FAC - offset intsavests[4]
+if	?INSERTBKPTS
+	mov	ds:intsavests[0],0E8CCh
+else
+	mov	ds:intsavests[0],0E890h
+endif
+	mov	ds:intsavests[2],si
+
 	jmp	@@finished
 
 @@readerr:
@@ -681,6 +776,9 @@ stage3:
 pVolSize	dw ?	; pointer to original VolSize function
 ife	?ONLYBUGFIXES
 pDevStat	dw ?	; pointer to original DevStat function
+wAudStat	dw 0	; word that can be ORed with return code to set busy bit
+
+sHSGread	ReadL {<?>}
 
 OurDevStat	proc near
 	mov	bx,offset pDevStat + S3FAC
@@ -695,6 +793,383 @@ OurDevStat	proc near
 @@:
 	ret
 OurDevStat	endp
+
+; Takes RedBook M:S:F address in EAX and returns HSG sector in EAX
+redbook2hsg	proc near	uses edx ecx
+	mov	edx,eax
+	shr	edx,10h	; EDX = minutes
+	imul	edx,edx,60
+	movzx	ecx,ah	; seconds
+	add	edx,ecx
+	imul	edx,edx,75
+	movzx	ecx,al	; frames
+	lea	eax,[ecx+edx-150]
+	ret
+redbook2hsg	endp
+
+; Takes HSG sector in EAX and returns RedBook M:S:F address in EAX
+hsg2redbook	proc near	uses edx ecx bx
+	add	eax,150
+	xor	edx,edx
+	mov	ecx,75
+	div	ecx
+	; Now EDX = frames, EAX = seconds + 60*minutes
+	mov	bl,dl
+	xor	edx,edx
+	mov	ecx,60
+	div	ecx
+	; Now EDX = seconds, EAX = minutes
+	mov	bh,dl
+	shl	eax,10h	; Move minutes into upper word
+	mov	ax,bx	; Get seconds and frames into lower word
+	ret
+hsg2redbook	endp
+
+; Called at beginning of interrupt to check for "busy" status
+ChkStatus	proc near
+	movzx	ax,es:[si].RqHdr.bCmd
+	movzx	bp,es:[si].RqHdr.bUnit
+
+	mov	ebx,42h		; ATAPI "READ SUB-CHANNEL"
+	mov	ecx,10000h	; Big-Endian: second byte is 01h
+				; (sub-channel data format = CD-ROM position)
+	mov	edx,4		; Just the header
+
+	cmp	ax,3		; IOCTL Read?
+	jne	@@issuecmd
+
+	push	es
+	push	si
+	les	si,dword ptr es:[si].IOCTLRW.wBufOff
+	mov	ah,es:[si]
+	pop	si
+	pop	es
+	cmp	ah,12		; QInfo
+	je	@F
+	cmp	ah,1		; LocHead
+	je	@F
+	xor	ah,ah
+	jmp	@@issuecmd
+
+@@:
+	; We're going to execute the command here, so change the return addx
+	add	sp,2		; discard the old one
+	push	intchecksts
+
+	mov	edx,10h		; The full set of sub-channel data
+	bts	ecx,1Eh		; SubQ bit (Big-Endian)
+
+	mov	di,es:[si].IOCTLRW.wCount
+	cmp	ah,12
+	jne	@F
+	cmp	di,sizeof QInfo
+	jb	@@badlen
+@@:
+	cmp	di,sizeof LocHead
+	jnb	@F
+@@badlen:
+	mov	bp,8005h	; bad length
+	jmp	@@done
+
+@@:
+	push	es
+	push	si
+	les	si,dword ptr es:[si].IOCTLRW.wBufOff
+
+	cmp	ah,12
+	je	@F
+	; if we're here, it's LocHead
+	cmp	es:[si].LocHead.bAMode,1
+	pop	si
+	pop	es
+
+	jb	@@issuecmd
+	je	@F
+	mov	bp,8003h	; unknown command
+	jmp	@@done
+
+@@:
+	mov	bh,2		; set MSF bit in ATAPI packet, using EBX
+
+@@issuecmd:
+	push	es
+	push	si
+	push	ax
+
+	mov	ax,bp		; get the unit number
+	mov	bp,send_pkt
+	call	bp
+	mov	bp,ax		; save return code
+
+	pop	ax
+	pop	si
+	pop	es
+	jc	@@done
+
+	xor	dx,dx
+	cmp	byte ptr ds:XferBuf[1],11h	; audio status == playing
+	jne	@@setstatcode
+	bts	dx,9		; "busy"
+
+	cmp	ax,80h		; READ LONG
+	je	@@failbusy
+	cmp	ax,82h		; READ LONG PREFETCH
+	je	@@failbusy
+	cmp	ax,83h		; SEEK
+	jne	@@setstatcode
+
+@@failbusy:
+	mov	ax,8002h	; drive not ready
+	mov	bp,ax		; since this sets AH!
+	add	sp,2		; discard the old return addx
+	push	intchecksts
+
+@@setstatcode:
+	mov	di,offset wAudStat + S3FAC
+	mov	[di],dx
+
+	test	ah,ah		; did we already service the command?
+	jz	@@done		; nope, proceed to Intel command service logic
+
+	push	es
+	push	si
+	les	si,dword ptr es:[si].IOCTLRW.wBufOff
+
+	cmp	ah,12		; QInfo
+	jne	@F		; LocHead
+
+	; A little knowledge is a dangerous thing...
+	; ATAPI CD-ROM drives do some conversion of the Q-Channel info before
+	; sending it to the host, which is generally helpful.
+	; They swap the control and ADR nibbles and convert all the BCD numbers.
+	; The MSCDEX spec requires the MSF frames to be converted from BCD, so
+	; in this case the hardware has already done that for us, we're good.
+	; *BUT* the MSCDEX spec requires that Control/ADR, Track Number and
+	; Index number be "passed through as they appear on the disc".
+	; So for those, we need to *undo* the hardware's helpful conversion :(
+	push	eax
+	mov	eax,ds:XferBuf[5]
+	ror	al,4		; swap Control/ADR
+	mov	es:[si].QInfo.bCtlADR,al
+
+	shr	eax,8		; AL = Track, AH = Index
+	mov	cl,ah		; Save Index
+	aam
+	shl	ah,4
+	or	al,ah
+
+	xchg	al,cl		; Get back the Index
+	aam
+	shl	ah,4
+	or	ah,al
+
+	mov	al,cl		; Get back the Track
+	mov	word ptr es:[si].QInfo.bTrack,ax
+
+	; Pass through non-BCD MSF values
+	; MSCDEX puts time-on-track first, opposite of ATAPI...
+	mov	eax,ds:XferBuf[13]
+	mov	dword ptr es:[si].QInfo.bMinute,eax
+	mov	eax,ds:XferBuf[9]
+	mov	dword ptr es:[si].QInfo._resd,eax
+
+	pop	eax
+	jmp	@@ioctldone
+
+@@:
+	mov	bx,SwapLBA
+	call	bx
+	mov	es:[si].LocHead.dwLoc,ebx
+
+@@ioctldone:
+	pop	si
+	pop	es
+@@done:
+	test	ah,ah
+	jz	@F
+	mov	ax,bp		; get return code
+	bt	ax,0Fh		; set carry if AX & 8000h
+@@:
+	ret
+ChkStatus	endp
+
+; Called at end of interrupt to set "busy" status bit in return structure
+SetStatus	proc near
+	mov	di,offset wAudStat + S3FAC
+	or	ax,[di]
+	mov	es:[bx].RqHdr.wStatus,ax
+	ret
+SetStatus	endp
+
+OurAtapiPktTail	proc near
+	; At this point, DS:SI points to a valid ATAPI packet, except
+	; this one byte that didn't get filled in because of our patching:
+	mov	[si+8],dl
+
+	; Now, check if it's a "read raw"...
+	cmp	byte ptr [si],0BEh
+	jne	@F
+	; If so, fill in the "data selection" field:
+	mov	byte ptr [si+9],0F8h ; Sync & All Headers & User Data + EDC/ECC
+
+@@:
+	; Maybe it's a "read TOC"?
+	cmp	byte ptr [si],43h
+	jne	@F
+	; Then [SI+5] contains a track number, which should be in [SI+6]
+	xchg	cl,byte ptr [si+5]	; CL should be zero
+	xchg	cl,byte ptr [si+6]
+
+@@:
+	ret
+OurAtapiPktTail	endp
+
+OurReadLong	proc near
+	cmp	es:[si].ReadL.bAMode,1
+	ja	@@invalid
+	je	@@msf
+
+	cmp	es:[si].ReadL.bRMode,1
+	ja	@@invalid
+	; Don't need to check for bRMode = 0 because this function should never
+	; be reached when bAMode and bRMode are both zero...
+
+	; If we're here then we need to do a raw read... *deep breath*
+	mov	ebx,0BEh	; ATAPI "READ CD"
+	mov	ecx,es:[si].ReadL.dwStart
+	movzx	edx,es:[si].ReadL.wSectors
+	imul	edx,9300001h	; Upper half = #bytes, lower half = #sectors
+	jo	@@invalid	; Data won't fit in one segment!
+
+	push	es
+	push	di
+	les	di,dword ptr es:[si].ReadL.wBufOff
+	mov	si,send_pkt_addx
+	call	si
+	pop	di
+	pop	es
+	ret
+
+@@msf:
+	cmp	byte ptr es:[si].ReadL.dwStart,75
+	jnb	@@invalid
+	cmp	byte ptr es:[si+1].ReadL.dwStart,60
+	jnb	@@invalid
+	cmp	byte ptr es:[si+2].ReadL.dwStart,100
+	jnb	@@invalid
+
+	; Right, all good. Create a copy of the request block...
+	push	es
+	push	si
+	push	fs
+	
+	push	es
+	pop	fs
+	push	ds
+	pop	es
+	assume	fs:nothing,es:driver
+	mov	cx,sizeof ReadL
+	mov	di,offset sHSGread + S3FAC
+	rep	movsb
+
+	mov	si,offset sHSGread + S3FAC
+	; ... and convert its starting point from redbook to HSG
+	push	eax
+	mov	eax,es:[si].ReadL.dwStart
+	call	redbook2hsg
+	mov	es:[si].ReadL.dwStart,eax
+	pop	eax
+	dec	es:[si].ReadL.bAMode
+
+	; Now pass this HSG-mode request through to the original function!
+	call	ds:CdromCmds[0]
+
+	pop	fs
+	pop	si
+	pop	es
+	assume	es:nothing,fs:driver
+	ret
+
+@@invalid:
+	mov	ax,8008h	; sector not found
+	ret
+OurReadLong	endp
+
+; TODO: Implement these
+PlayReq		proc near
+PlayReq		endp
+
+StopPlayReq	proc near
+StopPlayReq	endp
+
+ResumeReq	proc near
+ResumeReq	endp
+
+AudStat		proc near
+	mov	ax,8003h	; not implemented yet...
+	ret
+AudStat		endp
+
+; Takes unit number in AX and track number in CL
+; Reads TOC info for at most one track to internal transfer buffer
+; Returns track starting point (MSF) in EBX, return code in AX
+ReadTOC		proc near	uses es si di ; due to calling send_pkt!
+	mov	ebx,243h	; ATAPI "READ TOC" with MSF bit set
+	movzx	ecx,cl		; Format = 0 = data for specified track
+	mov	edx,0Ch		; Enough space for one track descriptor
+	
+	mov	bp,send_pkt
+	call	bp
+	jc	@F
+
+	; Track starting point is at XferBuf[8]
+	mov	bx,SwapLBA
+	call	bx
+	clc
+
+@@:
+	ret
+ReadTOC		endp
+
+DiskInfo	proc near
+	cmp	cx,size sDiskInfo
+	jnb	@F
+	mov	ax,8005h	; bad length
+	ret
+
+@@:
+	mov	ecx,0AAh	; leadout track
+	call	ReadTOC
+	jnc	@F
+	ret
+
+@@:
+	mov	es:[si].sDiskInfo.dwLOut,ebx
+	mov	bx,word ptr ds:XferBuf[2]
+	mov	word ptr es:[si].sDiskInfo.bLTrack,bx
+	ret
+DiskInfo	endp
+
+TnoInfo		proc near
+	cmp	cx,size sTnoInfo
+	jnb	@F
+	mov	ax,8005h	; bad length
+	ret
+
+@@:
+	mov	cl,es:[si].sTnoInfo.bTrack
+	call	ReadTOC
+	jnc	@F
+	ret
+
+@@:
+	mov	es:[si].sTnoInfo.dwStart,ebx
+	mov	bl,byte ptr ds:XferBuf[5]
+	ror	bl,4	; Swap Control/ADR!
+	mov	es:[si].sTnoInfo.bCtlADR,bl
+	clc
+	ret
+TnoInfo		endp
 endif
 
 OurVolSize	proc near
