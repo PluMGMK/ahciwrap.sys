@@ -21,7 +21,7 @@ For example, to use the second AHCI-mode SATA controller in your system:
 ```
 DEVICE=C:\AHCIWRAP\AHCIWRAP.SYS /s1 C:\SP39596\FILES\AHCI.SYS /d:AHCICD
 ```
-The `/sN` option selects the `N-1`th AHCI-mode SATA controller found on the PCI bus.
+The `/sN` option selects the `N+1`th AHCI-mode SATA controller found on the PCI bus.
 For RAID-mode SATA controllers, use `/rN` instead.
 
 If neither switch is specified, it tries the first AHCI-mode SATA controller, then the first RAID-mode one.
