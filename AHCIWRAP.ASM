@@ -4,6 +4,7 @@
 ?TESTWITHVBOX	equ 0
 ?ONLYBUGFIXES	equ 0
 ?INSERTBKPTS	equ 0
+?EMSAWARE	equ 1
 
 ; Structures
 RqHdr	struc			; DOS driver request header
@@ -127,14 +128,20 @@ intchecksts	equ 1E09h
 intloadcmd	equ word ptr 1DCEh
 intsavests	equ word ptr 1E0Dh
 endif
+if	?EMSAWARE
+; where the driver fills a linear address into "CTBA" field of command header
+fill_ctba	equ word ptr 2459h
+; where the driver fills a linear address into "DBA" field of a PRDT entry
+fill_prdt_dba	equ word ptr 247Ah
+endif
 ; Endpoints
 end_ahci_res	equ 2AC0h
 end_ahci_init	equ 2F75h
 
 ; Relocation factors
-S2FAC	equ	end_ahci_init - stage2
+S2FAC	equ	end_ahci_init - offset stage2
 S2LEN	equ	end_stage3 - stage2	; we have to relocate both at once!
-S3FAC	equ	end_ahci_res - stage3
+S3FAC	equ	end_ahci_res - offset stage3
 S3LEN	equ	end_stage3 - stage3
 
 	.code
@@ -236,8 +243,70 @@ inter_stg1	proc far
 	pop	bx
 
 	pushad
-	; Reload the pointer to the init request
 
+if	?EMSAWARE
+	push	ds
+	push	cs
+	pop	ds
+
+	mov	ax,3D00h	; OPEN read-only
+	xor	cl,cl
+	mov	dx,offset emm_name
+	int	21h
+	pop	ds
+	jc	@@noems
+
+	mov	bx,ax
+	mov	ax,4400h	; IOCTL - get device information
+	int	21h
+	jc	@@noems_fileopen
+	bt	dx,7		; device node?
+	jnc	@@noems_fileopen
+
+	mov	ax,4407h	; IOCTL - get output status
+	int	21h
+	test	al,al		; device ready?
+	jz	@@noems_fileopen
+
+	mov	ax,0DE00h	; VCPI installation check
+	mov	dx,bx		; save file handle
+	int	67h
+	mov	bx,dx		; get back file handle
+	test	ah,ah
+	jz	@@vcpiok
+
+	mov	dx,offset novcpi
+	call	init_msg
+	jmp	@@noems_fileopen
+
+@@vcpiok:
+	push	es
+	push	cs
+	pop	es
+	assume	es:driver
+
+	mov	di,offset end_stage3
+	mov	ax,5800h	; Get mappable address array
+	int	67h
+	test	ah,ah
+	jnz	@F
+	mov	[ems_pgs],cx
+
+	shl	cx,2
+	add	di,cx
+	mov	dword ptr [di],-1	; mark end of array
+
+@@:
+	pop	es
+	assume	es:nothing
+
+@@noems_fileopen:
+	mov	ah,3Eh		; CLOSE
+	int	21h
+@@noems:
+endif
+
+	; Reload the pointer to the init request
 	mov	ax,3000h	; DOS version / OEM check
 	int	21h
 	les	bp,[lpSavedReq]
@@ -252,9 +321,19 @@ inter_stg1	proc far
 	shl	eax,4	; convert segment to number of bytes
 	sub	esi,eax
 	add	edx,esi	; offset + segment*16 = total number of bytes
+if	?EMSAWARE
+	movzx	eax,[ems_pgs]
+	inc	eax	; include terminating -1
+	shl	eax,2	; amount of memory required to store map data
+	; After this, EAX is the largest amount of memory we'll need
+	; (after we relocate stage 2 but before we relocate stage 3)
+	add	eax,offset end_stage3 + S2FAC
+	cmp	edx,eax
+else
 	; This here is the largest amount of memory we'll need
 	; (after we relocate stage 2 but before we relocate stage 3)
 	cmp	edx,offset end_stage3 + S2FAC
+endif
 	jnb	@F
 
 	mov	dx,offset insufmem
@@ -447,6 +526,15 @@ inter_stg1	proc far
 	mov	si,offset stage2
 	mov	di,end_ahci_init
 	mov	cx,S2LEN
+if	?EMSAWARE
+	mov	ax,[ems_pgs]
+	test	ax,ax
+	jz	@F
+	inc	ax	; include terminating -1
+	shl	ax,2	; amount of memory required to store map data
+	add	cx,ax
+@@:
+endif
 	add	si,cx
 	add	di,cx
 	dec	si
@@ -459,6 +547,9 @@ inter_stg1	proc far
 	; Stage 2 is relocated, let's jump into it with a retf...
 	push	cs
 	push	offset stage2_init + S2FAC
+if	?EMSAWARE
+	mov	si,[ems_pgs]
+endif
 	ret
 
 @@nodev:
@@ -510,10 +601,18 @@ init_msg	proc near	uses ds
 	assume	ds:nothing
 init_msg	endp
 
+if	?EMSAWARE
+emm_name	db 'EMMXXXX0'	; device name for EMM
+ems_pgs		dw 0		; firstly terminates name, later becomes counter
+endif
+
 ; Messages
 no386		db "No 386 CPU, AHCI driver cannot start!",0Dh,0Ah,'$'
 nopcibios	db "No PCI BIOS, AHCI driver cannot find SATA controller!",0Dh,0Ah,'$'
 insufmem	db "Insufficient memory for AHCI driver to relocate itself!",0Dh,0Ah,'$'
+if	?EMSAWARE
+novcpi		db "EMS detected but no VCPI, DMA transfers to EMS buffers may fail silently!",0Dh,0Ah,'$'
+endif
 nonnumeric	db "Invalid non-numeric option for switch",0Dh,0Ah,'$'
 badswitch	db "Ignoring unrecognized switch /"
 badswitchb	db ?,0Dh,0Ah,'$'
@@ -531,9 +630,11 @@ stage2_init	proc far
 	; At this point, we have the following:
 	; * File handle for Intel driver in BX
 	; * DOS "Init" device request in ES:BP
-	; * Timeout ticks in SI
 	; * PCI bus/device/function in DI
 	; * Stack has "PUSHAD", ES, and the far return addx for the "interrupt"
+if	?EMSAWARE
+	; * Number of EMS pages in SI
+endif
 	push	ds
 	push	cs
 	pop	ds
@@ -558,6 +659,24 @@ stage2_init	proc far
 	mov	ds:[hard_pci_addx1],di
 	mov	ds:[hard_pci_addx2],di
 	mov	ds:[hard_pci_addx3],di
+
+if	?EMSAWARE
+	mov	bp,si	; keep the number of EMS pages safe in BP...
+	test	bp,bp
+	jz	@F
+
+	; replace "mov dword ptr [si],eax" with "call CheckEmSeg"
+	mov	ds:[fill_prdt_dba],0E8h	; call rel16
+	mov	ds:[fill_ctba],0E8h	; call rel16
+	; use S2FAC since this will be called from within init
+	; (i.e. before we relocate stage 3!)
+	mov	si,offset CheckEmSeg + S2FAC - (fill_prdt_dba+3)
+	mov	ds:fill_prdt_dba[1],si
+	mov	si,offset CheckEmSeg + S2FAC - (fill_ctba+3)
+	mov	ds:fill_ctba[1],si
+
+@@:
+endif
 
 	; Fix a messed-up mov instruction in Intel's code
 	; It is "mov ebx,0D3Eh" but should have been "mov ebx,dword ptr [0D3Eh]"
@@ -717,6 +836,13 @@ endif
 	movsw
 @@:
 	shr	cx,2
+if	?EMSAWARE
+	test	bp,bp
+	jz	@F
+	add	cx,bp
+	inc	cx	; include terminating -1
+@@:
+endif
 	rep	movsd
 	pop	es
 	assume	es:nothing
@@ -724,6 +850,28 @@ endif
 	; Intel's driver has stated that it ends at end_ahci_res, but our full
 	; driver actually ends S3LEN later - fix that up with DOS!
 	add	word ptr es:[bx].InitRq.lpEnd,S3LEN
+
+if	?EMSAWARE
+	test	bp,bp
+	jz	@F
+
+	; CheckEmSeg has been relocated so fixup the calls to it
+	;mov	si,(S3FAC) - (S2FAC)	; assembler refuses to assemble this
+	mov	si,end_ahci_res - end_ahci_init
+	sub	si,(offset stage3) - (offset stage2)
+	add	ds:fill_prdt_dba[1],si
+	add	ds:fill_ctba[1],si
+
+	inc	bp	; include terminating -1
+	shl	bp,2	; multiply by four to get full size of EMS table entries
+	add	word ptr es:[bx].InitRq.lpEnd,bp
+	jmp	@@lenfixed
+
+@@:
+	sub	word ptr es:[bx].InitRq.lpEnd,(end_stage3 - end_stage3_noems)
+
+@@lenfixed:
+endif
 
 	; patch the interrupt function to point to Stage 3
 	; change "mov al,es:[si].RqHdr.bCmd" to "call ChkStatus"
@@ -1190,6 +1338,69 @@ OurVolSize	proc near
 	ret
 OurVolSize	endp
 
+if	?EMSAWARE
+end_stage3_noems:
+CheckEmSeg	proc near uses di bx ecx edx
+	smsw	di
+	bt	di,0
+	jnc	@@done	; not in Protected Mode, no need to check anything
+
+	call	@F
+@@:
+	pop	di
+	; get (non-constant) address of end_stage3 into DI
+	add	di,(end_stage3 - @B)
+
+	; Iterate through EMS pages and figure out if buffer is in any of them
+	mov	ecx,eax
+	shr	ecx,4	; get the segment
+
+@@:
+	cmp	dword ptr [di],-1
+	je	@@done
+	cmp	cx,[di]	; is the buffer after the start of this page?
+	jb	@@next	; nope, check next one
+
+	mov	bx,cx
+	sub	bx,[di]
+	cmp	bx,400h	; is the buffer before the end of this page?
+	jnb	@@next	; nope, check next one
+
+	mov	bx,ax
+	and	bx,0FFFh; offset in page
+	shr	ecx,8	; turn segment into page index
+	mov	ax,0DE06h; get physical address of 4K Page
+	int	67h
+
+	test	ah,ah
+	jz	@@success
+
+	; uh-oh, VCPI couldn't tell us the physical page addx!
+	; just reconstruct the linear one and hope for the best...
+	movzx	eax,cx
+	shl	eax,12
+	or	ax,bx
+	jmp	@@done
+
+@@next:
+	add	di,4
+	jmp	@B
+
+@@success:
+	; EDX = beginning of physical page
+	mov	eax,edx
+	; BX = offset
+	or	ax,bx
+	; Now EAX = physical addx of buffer
+	; TODO: What about buffers on non-contiguous pages??
+
+@@done:
+	mov	[si],eax
+	ret
+CheckEmSeg	endp
+endif
+
+align	4
 end_stage3:
 driver	ends
 
