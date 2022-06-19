@@ -114,6 +114,7 @@ IoctlWriteCmds	equ word ptr 158Ah
 ife	?ONLYBUGFIXES
 ; Location to patch in ReadLong function
 ReadLongBadCom	equ word ptr 1EEBh
+SeekBadCom	equ word ptr 1F2Eh
 ; Last four bytes of function to build ATAPI packet
 AtapiPktTail	equ word ptr 2254h
 ; Function to send ATAPI command with transfer addx in ES:DI
@@ -785,6 +786,10 @@ ife	?ONLYBUGFIXES
 	mov	ds:ReadLongBadCom[0],0E9h	; jmp rel16
 	mov	si,offset OurReadLong + S3FAC - (ReadLongBadCom+3)
 	mov	ds:ReadLongBadCom[1],si
+	; Same story with Seek
+	mov	ds:SeekBadCom[0],0E9h		; jmp rel16
+	mov	si,offset OurSeek + S3FAC - (SeekBadCom+3)
+	mov	ds:SeekBadCom[1],si
 	; Patch function to build ATAPI packet
 	; Replace the last three bytes before the RETN with a push instruction,
 	; pushing an address of our own function tail so it jumps there instead!
@@ -1188,7 +1193,7 @@ OurReadLong	proc near
 	; Don't need to check for bRMode = 0 because this function should never
 	; be reached when bAMode and bRMode are both zero...
 
-	; If we're here then we need to do a raw read... *deep breath*
+	; If we're here then we need to do a raw read
 	mov	ebx,0BEh	; ATAPI "READ CD"
 	mov	ecx,es:[si].ReadL.dwStart
 	movzx	edx,es:[si].ReadL.wSectors
@@ -1248,6 +1253,53 @@ OurReadLong	proc near
 	mov	ax,8008h	; sector not found
 	ret
 OurReadLong	endp
+
+OurSeek		proc near
+	dec	es:[si].ReadL.bAMode
+	jnz	@@invalid
+
+	cmp	byte ptr es:[si].ReadL.dwStart,75
+	jnb	@@invalid
+	cmp	byte ptr es:[si+1].ReadL.dwStart,60
+	jnb	@@invalid
+	cmp	byte ptr es:[si+2].ReadL.dwStart,100
+	jnb	@@invalid
+
+	; Right, all good. Create a copy of the request block...
+	push	es
+	push	si
+	push	fs
+	
+	push	es
+	pop	fs
+	push	ds
+	pop	es
+	assume	fs:nothing,es:driver
+	mov	cx,sizeof ReadL
+	mov	di,offset sHSGread + S3FAC
+	rep	movsb es:[di],fs:[si]
+
+	mov	si,offset sHSGread + S3FAC
+	; ... and convert its starting point from redbook to HSG
+	push	eax
+	mov	eax,es:[si].ReadL.dwStart
+	call	redbook2hsg
+	mov	es:[si].ReadL.dwStart,eax
+	pop	eax
+
+	; Now pass this HSG-mode request through to the original function!
+	call	ds:CdromCmds[6]
+
+	pop	fs
+	pop	si
+	pop	es
+	assume	es:nothing,fs:driver
+	ret
+
+@@invalid:
+	mov	ax,8008h	; sector not found
+	ret
+OurSeek		endp
 
 ; TODO: Implement these
 PlayReq		proc near
