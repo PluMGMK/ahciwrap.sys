@@ -46,6 +46,13 @@ ReadL	struc
 	bISkip	db ?		; interleave skip factor
 ReadL	ends
 
+PlayReq	struc
+	sHdr	RqHdr <?>
+	bAMode	db ?		; addressing mode (RedBook / High Sierra)
+	dwStart	dd ?		; first sector
+	dwSectors dd ?
+PlayReq	ends
+
 LocHead		struc
 	bCode	db ?		; 1 for read
 	bAMode	db ?		; addressing mode (RedBook / High Sierra)
@@ -65,6 +72,13 @@ sTnoInfo	struc
 	dwStart	dd ?
 	bCtlADR	db ?
 sTnoInfo	ends
+
+sAudStat	struc
+	bCode	db ?		; 15 for read
+	wStatus	dw ?		; Bit 0 = paused, all others reserved
+	dwStart	dd ?
+	dwEnd	dd ?
+sAudStat	ends
 
 QInfo		struc
 	bCode	db ?		; 12 for read
@@ -797,11 +811,11 @@ ife	?ONLYBUGFIXES
 	mov	si,offset OurAtapiPktTail + S3FAC
 	mov	ds:AtapiPktTail[1],si
 
-	mov	si,offset PlayReq + S3FAC
+	mov	si,offset Play + S3FAC
 	mov	ds:CdromCmds[4*2],si
-	mov	si,offset StopPlayReq + S3FAC
+	mov	si,offset StopPlay + S3FAC
 	mov	ds:CdromCmds[5*2],si
-	mov	si,offset ResumeReq + S3FAC
+	mov	si,offset Resume + S3FAC
 	mov	ds:CdromCmds[8*2],si
 endif
 
@@ -931,6 +945,7 @@ pDevStat	dw ?	; pointer to original DevStat function
 wAudStat	dw 0	; word that can be ORed with return code to set busy bit
 
 sHSGread	ReadL {<?>}
+curAudStat	sAudStat {?}
 
 OurDevStat	proc near
 	mov	bx,offset pDevStat + S3FAC
@@ -1044,6 +1059,13 @@ ChkStatus	proc near
 	mov	bh,2		; set MSF bit in ATAPI packet, using EBX
 
 @@issuecmd:
+	cmp	ax,85h		; STOP AUDIO (pause)
+	jne	@F
+
+	mov	edx,10h		; The full set of sub-channel data
+	bts	ecx,1Eh		; SubQ bit (Big-Endian)
+
+@@:
 	push	es
 	push	si
 	push	ax
@@ -1077,9 +1099,21 @@ ChkStatus	proc near
 	push	intchecksts
 
 @@setstatcode:
+	cmp	byte ptr ds:XferBuf[1],12h	; audio status == paused
+	mov	di,offset curAudStat.wStatus + S3FAC
+	setz	[di]				; set bit 0 of AudStat word
+
 	mov	di,offset wAudStat + S3FAC
 	mov	[di],dx
 
+	cmp	ax,85h		; STOP AUDIO (pause)
+	jne	@F
+	mov	bx,SwapLBA
+	call	bx
+	mov	di,offset curAudStat.dwStart + S3FAC
+	mov	[di],ebx
+
+@@:
 	test	ah,ah		; did we already service the command?
 	jz	@@done		; nope, proceed to Intel command service logic
 
@@ -1301,18 +1335,139 @@ OurSeek		proc near
 	ret
 OurSeek		endp
 
-; TODO: Implement these
-PlayReq		proc near
-PlayReq		endp
+Play		proc near
+	cmp	es:[si].RqHdr.bLen,sizeof PlayReq
+	jae	@F
 
-StopPlayReq	proc near
-StopPlayReq	endp
+	mov	ax,8005h	; bad length
+	ret
 
-ResumeReq	proc near
-ResumeReq	endp
+@@:
+	cmp	es:[si].PlayReq.bAMode,1
+	jna	@F
+@@badsec:
+	mov	ax,8008h	; sector not found
+	ret
+
+@@:
+	mov	bp,ax		; save unit number
+	mov	eax,es:[si].PlayReq.dwStart
+	jb	@F		; we got a HSG address
+	call	redbook2hsg
+@@:
+	mov	ebx,45h		; ATAPI "PLAY AUDIO"
+	mov	ecx,eax
+	mov	edx,es:[si].PlayReq.dwSectors
+	cmp	edx,10000h	; can't play more than ~14.5 mins with command
+	jnb	@@badsec	; 45h... Should be enough for most usecases?
+
+	mov	ax,bp		; restore unit number
+	lea	ebp,[ecx+edx]	; end of the play window
+
+	; We have to be careful with the way the Intel driver handles data
+	; transfer. Because we have set a transfer length in sectors in DX,
+	; it will assume we want to read DX*2048 bytes into a buffer somewhere,
+	; unless we set the upper half of EDX to some other number.
+	; Set it to 1, and transfer a "dummy" byte somewhere harmless.
+	or	edx,10000h
+	push	es
+	push	di
+
+	push	cs
+	pop	es
+	mov	di,offset curAudStat + S3FAC	; unused byte
+	mov	si,send_pkt_addx
+	call	si
+	jc	@F
+
+	; audio is now playing!
+	bts	ax,9
+	mov	[di].sAudStat.wStatus,0
+	mov	[di].sAudStat.dwStart,ecx
+	mov	[di].sAudStat.dwEnd,ebp
+
+@@:
+	pop	di
+	pop	es
+	ret
+Play		endp
+
+StopPlay	proc near
+	xor	ecx,ecx
+	xor	edx,edx
+
+	mov	bx,offset curAudStat + S3FAC
+	bt	word ptr [bx].sAudStat.wStatus,0
+	jnc	@@pause	; not paused, so go do that
+
+	; already paused, so stop altogether
+	mov	ebx,4Eh
+	mov	bp,send_pkt
+	call	bp
+	jc	@F
+
+@@zeroblock:
+	; zero out the audio status block
+	mov	bx,offset curAudStat + S3FAC
+	mov	[bx].sAudStat.wStatus,cx
+	mov	[bx].sAudStat.dwStart,ecx
+	mov	[bx].sAudStat.dwEnd,ecx
+@@:
+	ret
+
+@@pause:
+	mov	bp,offset wAudStat + S3FAC
+	btr	word ptr ds:[bp],9
+
+	mov	bp,ax		; save unit number
+	mov	ax,8002h	; not ready
+	jnc	@@zeroblock	; not playing, nothing to pause
+
+	mov	ebx,4Bh		; ATAPI "PAUSE/RESUME"
+	mov	ax,bp		; get the unit number
+	mov	bp,send_pkt
+	call	bp
+	jnc	@B		; all good, return
+
+	bts	ax,9		; still playing since we failed to pause...
+	ret
+StopPlay	endp
+
+Resume		proc near
+	mov	bx,offset curAudStat + S3FAC
+	bt	word ptr [bx].sAudStat.wStatus,0
+	jc	@F
+
+	; not paused, nothing to do...
+	mov	ax,8002h	; not ready
+	ret
+
+@@:
+	mov	ebx,4Bh		; ATAPI "PAUSE/RESUME"
+	xor	ecx,ecx
+	mov	dx,1		; resume flag
+
+	mov	bp,send_pkt
+	call	bp
+	jc	@F
+
+	bt	ax,9		; playing
+@@:
+	ret
+Resume		endp
 
 AudStat		proc near
-	mov	ax,8003h	; not implemented yet...
+	cmp	cx,size sAudStat
+	jnb	@F
+	mov	ax,8005h	; bad length
+	ret
+
+@@:
+	lea	di,[si+1]	; now ES:DI points to user buffer, after bCode
+	mov	si,offset curAudStat + S3FAC + 1
+	dec	cx
+	cld
+	rep	movsb
 	ret
 AudStat		endp
 
