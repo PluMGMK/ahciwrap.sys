@@ -5,6 +5,7 @@
 ?ONLYBUGFIXES	equ 0
 ?INSERTBKPTS	equ 0
 ?EMSAWARE	equ 1
+?FIXUNALIGNED	equ 1
 
 ; Structures
 RqHdr	struc			; DOS driver request header
@@ -111,6 +112,15 @@ bad_ch0		equ byte ptr 1FE0h
 bad_ch1		equ byte ptr 1FE3h
 ; Bad sequence of instructions in LockDoor
 badlockdoor	equ dword ptr 1FEAh
+if	?FIXUNALIGNED
+; where the driver sets a transfer "offset" in a structure on the stack
+setxferoff	equ word ptr 2320h
+; where stopcmd gets called when a command is finished
+call_stopcmd	equ word ptr 2553h
+else
+; Bad jump on encountering unaligned transfer addx
+badjmp_unaln	equ byte ptr 2479h
+endif
 ; Hardcoded PCI addresses
 hard_pci_addx0	equ word ptr 2BEAh
 hard_pci_addx1	equ word ptr 2C04h
@@ -752,6 +762,11 @@ endif
 	mov	ds:badlockdoor[4],1EBBh
 	mov	ds:badlockdoor[8],0D2316600h
 
+ife	?FIXUNALIGNED
+	; this JMP goes two bytes too far, pull it back
+	sub	ds:[badjmp_unaln],2
+endif
+
 if	?TESTWITHVBOX
 	; VirtualBox has the index port at offset 8 from the base port,
 	; as opposed to 10h on QEMU and real hardware...
@@ -910,6 +925,19 @@ else
 endif
 	mov	ds:intsavests[2],si
 
+if	?FIXUNALIGNED
+	; change "mov [bp+0],ax" to "call ChkAlign"
+	mov	ds:setxferoff[0],0E8h	; call rel16
+	mov	si,offset ChkAlign + S3FAC - offset setxferoff[3]
+	mov	ds:setxferoff[1],si
+	; change "call stopcmd" to "call FixAlign"
+	mov	si,offset FixAlign + S3FAC - offset call_stopcmd[3]
+	xchg	si,ds:call_stopcmd[1]
+	add	si,offset call_stopcmd[3]
+	mov	di,offset pStopcmd + S3FAC
+	mov	[di],si				; save addx of actual stopcmd
+endif
+
 	jmp	@@finished
 
 @@readerr:
@@ -940,6 +968,11 @@ stage3:
 	assume	ds:driver,ss:driver,fs:driver,gs:driver
 
 pVolSize	dw ?	; pointer to original VolSize function
+if	?FIXUNALIGNED
+pStopcmd	dw ?	; pointer to original stopcmd function
+bSavedByte	db ?
+bUnaligned	db 0	; set to 1 when an unaligned read is in progress
+endif
 ife	?ONLYBUGFIXES
 pDevStat	dw ?	; pointer to original DevStat function
 wAudStat	dw 0	; word that can be ORed with return code to set busy bit
@@ -1368,7 +1401,7 @@ Play		proc near
 	; transfer. Because we have set a transfer length in sectors in DX,
 	; it will assume we want to read DX*2048 bytes into a buffer somewhere,
 	; unless we set the upper half of EDX to some other number.
-	; Set it to 1, and transfer a "dummy" byte somewhere harmless.
+	; Set it to 1 to stop this (as it rounds down to nearest DWORD).
 	or	edx,10000h
 	push	es
 	push	di
@@ -1420,7 +1453,7 @@ StopPlay	proc near
 	btr	word ptr ds:[bp],9
 
 	mov	bp,ax		; save unit number
-	mov	ax,8002h	; not ready
+	mov	ax,100h		; "successfully" ignore request
 	jnc	@@zeroblock	; not playing, nothing to pause
 
 	mov	ebx,4Bh		; ATAPI "PAUSE/RESUME"
@@ -1545,9 +1578,59 @@ OurVolSize	proc near
 	ret
 OurVolSize	endp
 
+if	?FIXUNALIGNED
+ChkAlign	proc near	uses es di si
+	mov	di,offset bSavedByte + S3FAC
+
+	btr	ax,0
+	setc	[di+1]
+	jnc	@F
+
+	mov	es,dx
+	mov	si,ax
+
+	push	ax
+	mov	al,es:[si]
+	mov	[di],al
+	pop	ax
+
+@@:
+	mov	[bp],ax
+	ret
+ChkAlign	endp
+
+FixAlign	proc near
+	mov	bx,offset pStopcmd + S3FAC
+	mov	bx,[bx]
+	call	bx
+
+	mov	bx,offset bSavedByte + S3FAC
+	btr	word ptr [bx],8
+	jnc	@F
+
+	mov	es,[bp+2]	; transfer segment
+	mov	si,[bp]		; transfer offset
+	mov	cx,[bp+10h]	; number of dwords
+
+	std	; start from the end since we're moving dwords forwards
+	mov	di,cx
+	dec	di
+	shl	di,2
+	add	si,di
+	lea	di,[si+1]	; move forwards by one byte
+	rep	movsd es:[di],es:[si]
+
+	mov	al,[bx]
+	mov	es:[si],al	; restore saved byte
+
+@@:
+	ret
+FixAlign	endp
+endif
+
 if	?EMSAWARE
 end_stage3_noems:
-CheckEmSeg	proc near uses di bx ecx edx
+CheckEmSeg	proc near	uses di bx ecx edx
 	smsw	di
 	bt	di,0
 	jnc	@@done	; not in Protected Mode, no need to check anything
