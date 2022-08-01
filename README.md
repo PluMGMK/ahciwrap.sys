@@ -1,13 +1,11 @@
 # ahciwrap.sys
-A DOS CD-ROM driver to augment (and fix) functionality of Intel's `ahci.sys`, available from http://ftp.hp.com/pub/softpaq/sp39501-40000/sp39596.exe*.
+A DOS CD-ROM driver to augment (and fix) functionality of Intel's `ahci.sys`, available from http://www.win3x.org/win3board/viewtopic.php?t=295.
 
 The `ahci.sys` driver is great, because it allows the use from DOS of CD-ROM drives attached to modern SATA controllers in AHCI mode.
 Many motherboards from the latter half of the 2010s can boot DOS (non-UEFI boot), but don't allow the SATA controller to be set to IDE mode, so this is the only option to get CD support with such a setup.
 
 However, there are a few bugs with this driver, and several functions (audio playback, raw reading, and use of controllers at PCI addresses other than 00:1f.2) are not supported.
 This is what this project sets out to solve!
-
-\* Note that if that link ever disappears, it is still available on the Wayback Machine: http://web.archive.org/web/20171016094536/http://whp-hou4.cold.extweb.hp.com/pub/softpaq/sp39501-40000/sp39596.exe
 
 ## Building
 
