@@ -4,7 +4,8 @@
 ?TESTWITHVBOX	equ 0
 ?ONLYBUGFIXES	equ 0
 ?INSERTBKPTS	equ 0
-?EMSAWARE	equ 1
+?VDSAWARE	equ 1
+?BACKUP_STATE	equ 1	; backup port states before issuing IDENTIFY
 ?FIXUNALIGNED	equ 1
 
 ; Structures
@@ -54,11 +55,11 @@ PlayReq	struc
 	dwSectors dd ?
 PlayReq	ends
 
-LocHead		struc
+LocHead	struc
 	bCode	db ?		; 1 for read
 	bAMode	db ?		; addressing mode (RedBook / High Sierra)
 	dwLoc	dd ?		; head location returned from driver
-LocHead		ends
+LocHead	ends
 
 sDiskInfo	struc
 	bCode	db ?		; 10 for read
@@ -94,6 +95,115 @@ QInfo		struc
 	bPSec	db ?
 	bPFrame	db ?
 QInfo		ends
+
+if	?VDSAWARE
+; Extra flags used if ?VDSAWARE:
+; Bit 4 = FIS DMA region locked
+EBIT_FIS_DDS_LOCKED	equ 4
+EFLAG_FIS_DDS_LOCKED	equ 1 SHL EBIT_FIS_DDS_LOCKED
+; Bit 5 = CmdList DMA region locked
+EBIT_CL_DDS_LOCKED	equ 5
+EFLAG_CL_DDS_LOCKED	equ 1 SHL EBIT_CL_DDS_LOCKED
+; Bit 6 = CmdTable DMA region locked
+EBIT_CTBL_DDS_LOCKED	equ 6
+EFLAG_CTBL_DDS_LOCKED	equ 1 SHL EBIT_CTBL_DDS_LOCKED
+; Bit 7 = PRDT DMA region locked
+EBIT_PRDT_EDDS_LOCKED	equ 7
+EFLAG_PRDT_EDDS_LOCKED	equ 1 SHL EBIT_PRDT_EDDS_LOCKED
+endif
+
+; This structure is at SS:[BP] during most of AHCI.SYS's operation
+ahcidrv_stack	struc
+	lpDataBase	dd ?
+	qwLBA		dq ?
+	dwExpectedCount	dd ?
+	wDwordCount	dw ?
+	wPortOffset	dw ?
+	bCount		db ?
+	bPort		db ?
+	bDevice		db ?	; For port multipliers
+	bFlags		db ?	; We can use extra flags, as given above
+	bSlotMask	db ?
+	bCurSlot	db ?
+if	?BACKUP_STATE
+	qwSavedFB	dq ?
+	qwSavedCLB	dq ?
+	dwSavedCmd	dd ?
+	unused		db 18 dup(?)
+else
+	unused		db 38 dup(?)
+endif
+	pushad_edi	dd ?
+	pushad_esi	dd ?
+	pushad_ebp	dd ?
+	pushad_esp	dd ?
+	pushad_ebx	dd ?
+	pushad_edx	dd ?
+	pushad_ecx	dd ?
+	pushad_eax	dd ?
+	client_ds	dw ?
+	client_es	dw ?
+	client_fs	dw ?
+	client_gs	dw ?
+ahcidrv_stack	ends
+
+if	?VDSAWARE
+; The most data we can transfer is a single segment is 10000h bytes.
+; This is 10h pages, but the beginning and end aren't necessarily page-aligned
+; so the data may span a total of 11h pages.
+?MAX_PRDT_ENTRIES	equ 11h
+
+HBA_PRDT_ENTRY	struc
+	dba	dq ?
+	rsv0	dd ?
+	dbc	dd ?	; MSB = i = interrupt on completion
+HBA_PRDT_ENTRY	ends
+
+HBA_CMD_TBL	struc
+	cfis	db 14h dup (?)
+	_resd0	db 2Ch dup (?)
+	acmd	db 10h dup (?)
+	_resd1	db 30h dup (?)
+	prdt	HBA_PRDT_ENTRY ?MAX_PRDT_ENTRIES dup (<?>)
+HBA_CMD_TBL	ends
+
+DD_Struc	struc
+	DD_size		dd ?
+	DD_offset	dd ?
+	DD_segment	dw ?
+	DD_bufid	dw ?
+	DD_physaddx	dd ?
+DD_Struc	ends
+
+EDD_Region	struc
+	EDD_physaddx	dd ?
+	EDD_physsize	dd ?
+EDD_Region	ends
+
+EDD_Struc	struc
+	EDD_size	dd ?
+	EDD_offset	dd ?
+	EDD_segment	dd ?
+	EDD_numavail	dw ?
+	EDD_numused	dw ?
+	EDD_regions	EDD_Region ?MAX_PRDT_ENTRIES dup (<?>)
+EDD_Struc	ends
+
+; A nice big structure to make better use of space lying idle in Intel's driver!
+CmdTbl_plus_VDS	struc
+	; The command table, as set up by Intel's driver itself
+	CmdTable	HBA_CMD_TBL <?>
+	; DDSes to lock the DMA regions for command table, command list and FIS
+	CmdTbl_DDS	DD_Struc <?>
+	CmdList_DDS	DD_Struc <?>
+	FIS_DDS		DD_Struc <?>
+	; An EDDS to lock the scatter/gather DMA region for the actual data transfer
+	; (used in turn to fill in the PRDT)
+	PRDT_EDDS	EDD_Struc <?>
+CmdTbl_plus_VDS	ends
+; Intel driver only gives us 1 kiB to play with...
+.errnz ((sizeof CmdTbl_plus_VDS) gt 400h)
+endif
 
 ; Code/data positions in Intel's AHCI driver
 num_drives	equ byte ptr 15h
@@ -153,12 +263,37 @@ intchecksts	equ 1E09h
 intloadcmd	equ word ptr 1DCEh
 intsavests	equ word ptr 1E0Dh
 endif
-if	?EMSAWARE
+if	?VDSAWARE
+; where the driver fills a linear address into "CLB" field of the port
+set_cmdlistbase	equ word ptr 263Dh	; add eax,ebx
+; where the driver fills a linear address into "FB" field of the port
+set_fisbase	equ word ptr 2661h	; add eax,ebx
 ; where the driver fills a linear address into "CTBA" field of command header
-fill_ctba	equ word ptr 2459h
-; where the driver fills a linear address into "DBA" field of a PRDT entry
-fill_prdt_dba	equ word ptr 247Ah
+fill_ctba	equ word ptr 2456h	; add eax,ebx
+; where the driver starts setting up PRDT entries
+setup_prdt	equ word ptr 246Fh	; shl edx,4
+setup_prdt_done	equ 24AAh	; return to here to skip Intel's logic
+; where the driver calls a function to wait for the CR bit to be unset
+stop_cmd_wtcrus	equ word ptr 25FFh	; call wait_cr_unset
+; the function it calls
+wait_cr_unset	equ 2735h
+
+pCmdTable	equ word ptr 30h
 endif
+if	?BACKUP_STATE
+; where the driver calls "stop_cmd" before starting the IDENTIFY sequence
+idn_stop_cmd	equ word ptr 22B3h
+; where the driver calls "do_pio_cmd" to execute the IDENTIFY sequence
+idn_do_pio_cmd	equ word ptr 22D2h
+; the functions it's actually calling
+stop_cmd	equ 25CCh
+do_pio_cmd	equ 24EBh
+
+; helper functions that we can also use
+read_hbaport	equ 28ECh
+write_hbaport	equ 2926h
+endif
+
 ; Endpoints
 end_ahci_res	equ 2AC0h
 end_ahci_init	equ 2F75h
@@ -168,6 +303,11 @@ S2FAC	equ	end_ahci_init - offset stage2
 S2LEN	equ	end_stage3 - stage2	; we have to relocate both at once!
 S3FAC	equ	end_ahci_res - offset stage3
 S3LEN	equ	end_stage3 - stage3
+
+; Other miscellaneous equates
+BDA_SEGMENT	equ 40h	; BIOS Data Area segment
+EBDA_OFFSET	equ 0Eh	; Offset within BDA of pointer to Extended BDA segment
+VDS_FLAG_OFFSET	equ 7Bh	; Offset within BDA of Virtual DMA Spec flags
 
 	.code
 driver	segment	use16
@@ -266,70 +406,7 @@ inter_stg1	proc far
 	; Get rid of the 16-bit ones on the stack first...
 	pop	ax
 	pop	bx
-
 	pushad
-
-if	?EMSAWARE
-	push	ds
-	push	cs
-	pop	ds
-
-	mov	ax,3D00h	; OPEN read-only
-	xor	cl,cl
-	mov	dx,offset emm_name
-	int	21h
-	pop	ds
-	jc	@@noems
-
-	mov	bx,ax
-	mov	ax,4400h	; IOCTL - get device information
-	int	21h
-	jc	@@noems_fileopen
-	bt	dx,7		; device node?
-	jnc	@@noems_fileopen
-
-	mov	ax,4407h	; IOCTL - get output status
-	int	21h
-	test	al,al		; device ready?
-	jz	@@noems_fileopen
-
-	mov	ax,0DE00h	; VCPI installation check
-	mov	dx,bx		; save file handle
-	int	67h
-	mov	bx,dx		; get back file handle
-	test	ah,ah
-	jz	@@vcpiok
-
-	mov	dx,offset novcpi
-	call	init_msg
-	jmp	@@noems_fileopen
-
-@@vcpiok:
-	push	es
-	push	cs
-	pop	es
-	assume	es:driver
-
-	mov	di,offset end_stage3
-	mov	ax,5800h	; Get mappable address array
-	int	67h
-	test	ah,ah
-	jnz	@F
-	mov	[ems_pgs],cx
-
-	shl	cx,2
-	add	di,cx
-	mov	dword ptr [di],-1	; mark end of array
-
-@@:
-	pop	es
-	assume	es:nothing
-
-@@noems_fileopen:
-	mov	ah,3Eh		; CLOSE
-	int	21h
-@@noems:
-endif
 
 	; Reload the pointer to the init request
 	mov	ax,3000h	; DOS version / OEM check
@@ -346,19 +423,9 @@ endif
 	shl	eax,4	; convert segment to number of bytes
 	sub	esi,eax
 	add	edx,esi	; offset + segment*16 = total number of bytes
-if	?EMSAWARE
-	movzx	eax,[ems_pgs]
-	inc	eax	; include terminating -1
-	shl	eax,2	; amount of memory required to store map data
-	; After this, EAX is the largest amount of memory we'll need
-	; (after we relocate stage 2 but before we relocate stage 3)
-	add	eax,offset end_stage3 + S2FAC
-	cmp	edx,eax
-else
 	; This here is the largest amount of memory we'll need
 	; (after we relocate stage 2 but before we relocate stage 3)
 	cmp	edx,offset end_stage3 + S2FAC
-endif
 	jnb	@F
 
 	mov	dx,offset insufmem
@@ -551,15 +618,6 @@ endif
 	mov	si,offset stage2
 	mov	di,end_ahci_init
 	mov	cx,S2LEN
-if	?EMSAWARE
-	mov	ax,[ems_pgs]
-	test	ax,ax
-	jz	@F
-	inc	ax	; include terminating -1
-	shl	ax,2	; amount of memory required to store map data
-	add	cx,ax
-@@:
-endif
 	add	si,cx
 	add	di,cx
 	dec	si
@@ -572,9 +630,6 @@ endif
 	; Stage 2 is relocated, let's jump into it with a retf...
 	push	cs
 	push	offset stage2_init + S2FAC
-if	?EMSAWARE
-	mov	si,[ems_pgs]
-endif
 	ret
 
 @@nodev:
@@ -626,18 +681,10 @@ init_msg	proc near	uses ds
 	assume	ds:nothing
 init_msg	endp
 
-if	?EMSAWARE
-emm_name	db 'EMMXXXX0'	; device name for EMM
-ems_pgs		dw 0		; firstly terminates name, later becomes counter
-endif
-
 ; Messages
 no386		db "No 386 CPU, AHCI driver cannot start!",0Dh,0Ah,'$'
 nopcibios	db "No PCI BIOS, AHCI driver cannot find SATA controller!",0Dh,0Ah,'$'
 insufmem	db "Insufficient memory for AHCI driver to relocate itself!",0Dh,0Ah,'$'
-if	?EMSAWARE
-novcpi		db "EMS detected but no VCPI, DMA transfers to EMS buffers may fail silently!",0Dh,0Ah,'$'
-endif
 nonnumeric	db "Invalid non-numeric option for switch",0Dh,0Ah,'$'
 badswitch	db "Ignoring unrecognized switch /"
 badswitchb	db ?,0Dh,0Ah,'$'
@@ -651,15 +698,84 @@ badsize		db "File specified does not appear to be Intel AHCI driver file! (wrong
 ; -------   * gets relocated beyond the end of the loaded driver
 ; -------   * gets discarded when we tell DOS how much to keep allocated
 stage2:
+; These can be in stage 2 since they're not needed after init
+if	?BACKUP_STATE
+SavePortState	proc near
+	push	bx
+	push	di
+	mov	di,read_hbaport	; need to call indirectly...
+
+	xor	bx,bx		; CLB is at offset zero
+	call	di
+	mov	dword ptr [bp.ahcidrv_stack.qwSavedCLB],eax
+	add	bx,4		; upper half
+	call	di
+	mov	dword ptr [bp.ahcidrv_stack.qwSavedCLB+4],eax
+
+	mov	bx,8		; FB is at offset 8
+	call	di
+	mov	dword ptr [bp.ahcidrv_stack.qwSavedFB],eax
+	add	bx,4		; upper half
+	call	di
+	mov	dword ptr [bp.ahcidrv_stack.qwSavedFB+4],eax
+
+	mov	bx,18h		; Cmd is at offset 18h
+	call	di
+	mov	dword ptr [bp.ahcidrv_stack.dwSavedCmd],eax
+
+	pop	di
+	pop	bx
+
+	; Jump back to the original function (have to do it indirectly)
+	mov	ax,stop_cmd
+	jmp	ax
+SavePortState	endp
+
+RestPortState	proc near
+	; Call through to the original function (have to do it indirectly)
+	mov	ax,do_pio_cmd
+	call	ax
+
+	push	eax
+	push	bx
+	push	di
+	mov	di,write_hbaport; need to call indirectly...
+
+	xor	bx,bx		; CLB is at offset zero
+	mov	eax,dword ptr [bp.ahcidrv_stack.qwSavedCLB]
+	call	di
+	add	bx,4		; upper half
+	mov	eax,dword ptr [bp.ahcidrv_stack.qwSavedCLB+4]
+	call	di
+
+	mov	bx,8		; FB is at offset 8
+	mov	eax,dword ptr [bp.ahcidrv_stack.qwSavedFB]
+	call	di
+	add	bx,4		; upper half
+	mov	eax,dword ptr [bp.ahcidrv_stack.qwSavedFB+4]
+	call	di
+
+	mov	bx,18h		; Cmd is at offset 8
+	mov	eax,dword ptr [bp.ahcidrv_stack.dwSavedCmd]
+	call	di
+
+	pop	di
+	pop	bx
+	pop	eax
+
+	; set CF as appropriate for return from do_pio_cmd
+	cmp	ah,1
+	cmc
+	ret
+RestPortState	endp
+endif
+
 stage2_init	proc far
 	; At this point, we have the following:
 	; * File handle for Intel driver in BX
 	; * DOS "Init" device request in ES:BP
 	; * PCI bus/device/function in DI
 	; * Stack has "PUSHAD", ES, and the far return addx for the "interrupt"
-if	?EMSAWARE
-	; * Number of EMS pages in SI
-endif
 	push	ds
 	push	cs
 	pop	ds
@@ -685,22 +801,52 @@ endif
 	mov	ds:[hard_pci_addx2],di
 	mov	ds:[hard_pci_addx3],di
 
-if	?EMSAWARE
-	mov	bp,si	; keep the number of EMS pages safe in BP...
-	test	bp,bp
-	jz	@F
-
-	; replace "mov dword ptr [si],eax" with "call CheckEmSeg"
-	mov	ds:[fill_prdt_dba],0E8h	; call rel16
-	mov	ds:[fill_ctba],0E8h	; call rel16
+if	?VDSAWARE
+	; replace "add eax,ebx" with "call FixupCLB" / "call FixupFB"
+	mov	ds:[set_cmdlistbase],0E8h	; call rel16
+	mov	ds:[set_fisbase],0E8h		; call rel16
+	mov	ds:[fill_ctba],0E8h		; call rel16
+	mov	ds:[setup_prdt],0E8h		; call rel16
+if	?INSERTBKPTS
+	mov	ds:setup_prdt[2],0CC00h		; int3 after three bytes
+else
+	mov	ds:setup_prdt[2],9000h		; nop after three bytes
+endif
 	; use S2FAC since this will be called from within init
 	; (i.e. before we relocate stage 3!)
-	mov	si,offset CheckEmSeg + S2FAC - (fill_prdt_dba+3)
-	mov	ds:fill_prdt_dba[1],si
-	mov	si,offset CheckEmSeg + S2FAC - (fill_ctba+3)
+	mov	si,offset FixupCLB + S2FAC - (set_cmdlistbase+3)
+	mov	ds:set_cmdlistbase[1],si
+	mov	si,offset FixupFB + S2FAC - (set_fisbase+3)
+	mov	ds:set_fisbase[1],si
+	mov	si,offset FixupCTBA + S2FAC - (fill_ctba+3)
 	mov	ds:fill_ctba[1],si
+	mov	si,offset FixupPRDT + S2FAC - (setup_prdt+3)
+	mov	ds:setup_prdt[1],si
+	; this is already a call, so no need to insert 0E8h
+	mov	si,offset stop_cmd_redir + S2FAC - (stop_cmd_wtcrus+3)
+	mov	ds:stop_cmd_wtcrus[1],si
+endif
 
-@@:
+if	?BACKUP_STATE
+	; Intel's AHCI CD driver is designed to operate in conjunction with its
+	; AHCI firmware, which handles int 13h requests. Intel's firmware and CD
+	; driver both reinitialize the FB, CLB and Cmd registers before every
+	; transaction, which means there is no conflict between them, even when
+	; the CD driver temporarily takes control of each port to identify the
+	; attached devices.
+	; HOWEVER, other firmware (e.g. SeaBIOS) naively assumes that nobody
+	; interferes with FB, CLB and Cmd, which results in all int 13h requests
+	; timing out after this driver attempts to identify the devices.
+	; To prevent this, we save FB, CLB and Cmd before each IDENTIFY command
+	; is issued, and restore them afterwards.
+
+	; these are already calls, so no need to insert 0E8h
+	mov	si,offset SavePortState + S2FAC - (idn_stop_cmd+3)
+	mov	ds:idn_stop_cmd[1],si
+	mov	si,offset RestPortState + S2FAC - (idn_do_pio_cmd+3)
+	mov	ds:idn_do_pio_cmd[1],si
+	; Note: we don't need to fix these up later, since the IDENTIFY sequence
+	; is only ever called from the init code!
 endif
 
 	; Fix a messed-up mov instruction in Intel's code
@@ -870,13 +1016,7 @@ endif
 	movsw
 @@:
 	shr	cx,2
-if	?EMSAWARE
-	test	bp,bp
-	jz	@F
-	add	cx,bp
-	inc	cx	; include terminating -1
-@@:
-endif
+.erre	S3LEN LE ($ + S2FAC) - end_ahci_res, <"Stage 3 too big!">
 	rep	movsd
 	pop	es
 	assume	es:nothing
@@ -885,26 +1025,16 @@ endif
 	; driver actually ends S3LEN later - fix that up with DOS!
 	add	word ptr es:[bx].InitRq.lpEnd,S3LEN
 
-if	?EMSAWARE
-	test	bp,bp
-	jz	@F
-
-	; CheckEmSeg has been relocated so fixup the calls to it
+if	?VDSAWARE
+	; FixupCLB & co. have been relocated so fixup the calls to them
 	;mov	si,(S3FAC) - (S2FAC)	; assembler refuses to assemble this
 	mov	si,end_ahci_res - end_ahci_init
 	sub	si,(offset stage3) - (offset stage2)
-	add	ds:fill_prdt_dba[1],si
+	add	ds:set_cmdlistbase[1],si
+	add	ds:set_fisbase[1],si
 	add	ds:fill_ctba[1],si
-
-	inc	bp	; include terminating -1
-	shl	bp,2	; multiply by four to get full size of EMS table entries
-	add	word ptr es:[bx].InitRq.lpEnd,bp
-	jmp	@@lenfixed
-
-@@:
-	sub	word ptr es:[bx].InitRq.lpEnd,(end_stage3 - end_stage3_noems)
-
-@@lenfixed:
+	add	ds:setup_prdt[1],si
+	add	ds:stop_cmd_wtcrus[1],si
 endif
 
 	; patch the interrupt function to point to Stage 3
@@ -1628,66 +1758,246 @@ FixAlign	proc near
 FixAlign	endp
 endif
 
-if	?EMSAWARE
-end_stage3_noems:
-CheckEmSeg	proc near	uses di bx ecx edx
-	smsw	di
-	bt	di,0
-	jnc	@@done	; not in Protected Mode, no need to check anything
+if	?VDSAWARE
+; Takes:
+; DI = offset of DDS within CmdTbl_plus_VDS
+; DS:EBX = location of region to lock
+; ECX = size of region to lock
+; DX = flag to check/set on stack
+LockRegion	proc near	uses es
+	add	eax,ebx		; this is the instruction we've overwritten
 
+	call	Check_VDS
+	jnc	@F
+
+	bt	word ptr [bp.ahcidrv_stack.bFlags],dx
+	jc	@F
+
+	push	cs
+	pop	es
+
+	add	di,ds:[pCmdTable]
+	mov	es:[di.DD_Struc.DD_size],ecx
+	; The segment is in DS, and the offset is in EBX
+	mov	es:[di.DD_Struc.DD_offset],ebx
+	mov	es:[di.DD_Struc.DD_segment],ds
+
+	push	eax
+	push	dx
+	mov	ax,8103h; LOCK DMA REGION
+	mov	dx,4	; buffer should not be allocated if non-contiguous
+	int	4Bh
+	pop	dx
+	pop	eax
+
+	jc	@F	; use the Linear Address and hope for the best
+	mov	eax,es:[di.DD_Struc.DD_physaddx]
+	bts	word ptr [bp.ahcidrv_stack.bFlags],dx
+
+@@:
+	ret
+LockRegion	endp
+
+FixupCLB	proc near	uses ecx di dx
+	mov	ecx,400h	; A command list can be up to 1 kiB long
+	mov	di,CmdTbl_plus_VDS.CmdList_DDS
+	mov	dx,EBIT_CL_DDS_LOCKED
+	call	LockRegion
+	ret
+FixupCLB	endp
+
+FixupFB		proc near	uses ecx di dx
+	mov	ecx,100h	; FIS is 100h bytes long
+	mov	di,CmdTbl_plus_VDS.FIS_DDS
+	mov	dx,EBIT_FIS_DDS_LOCKED
+	call	LockRegion
+	ret
+FixupFB		endp
+
+FixupCTBA	proc near	uses ecx di dx
+	mov	ecx,size HBA_CMD_TBL
+	mov	di,CmdTbl_plus_VDS.CmdTbl_DDS
+	mov	dx,EBIT_CTBL_DDS_LOCKED
+	call	LockRegion
+	ret
+FixupCTBA	endp
+
+FixupPRDT	proc near
+	call	Check_VDS
+	jnc	@F
+
+	bt	word ptr [bp.ahcidrv_stack.bFlags],EBIT_PRDT_EDDS_LOCKED
+	jc	@F
+
+	push	eax
+	push	edx
+	push	es
+	push	di
+
+	push	cs
+	pop	es
+
+	mov	di,ds:[pCmdTable]
+	add	di,CmdTbl_plus_VDS.PRDT_EDDS
+	; The segment is in EDX, and the offset is in EAX
+	mov	es:[di.EDD_Struc.EDD_offset],eax
+	mov	es:[di.EDD_Struc.EDD_segment],edx
+	mov	es:[di.EDD_Struc.EDD_numavail],?MAX_PRDT_ENTRIES
+	; The size is on the stack:
+	movzx	eax,[bp.ahcidrv_stack.wDwordCount]
+	shl	eax,2
+	mov	es:[di.EDD_Struc.EDD_size],eax
+
+	mov	ax,8105h; SCATTER/GATHER LOCK REGION
+	xor	dx,dx	; no flags
+	int	4Bh
+
+	pop	di
+	pop	es
+	pop	edx
+	pop	eax
+
+	jnc	@@fill_prdt
+@@:
+	; If we're here, then we didn't lock an EDDS
+	shl	edx,4	; carry out the instruction we overwrote
+	ret
+
+@@fill_prdt:
+	; Firstly, change the return address since we're skipping over Intel's
+	; logic that assumes only one PRDT entry
+	add	sp,2
+	push	setup_prdt_done
+
+	; At this point, DS:SI points to the beginning of the PRDT, and needs to
+	; be filled with addresses / sizes from the EDDS we just locked.
+	; As far as I can tell, we can scratch BX here.
+	mov	bx,ds:[pCmdTable]
+	add	bx,CmdTbl_plus_VDS.PRDT_EDDS
+	; CX needs to contain the total number of PRDT entries
+	mov	cx,[bx.EDD_Struc.EDD_numused]
+	push	cx
+	add	bx,EDD_Struc.EDD_regions
+
+@@:
+	; Set the base address
+	mov	eax,[bx.EDD_Region.EDD_physaddx]
+	mov	dword ptr [si.HBA_PRDT_ENTRY.dba],eax
+	; Zero out unused fields
+	xor	eax,eax
+	mov	dword ptr [si.HBA_PRDT_ENTRY.dba+4],eax
+	mov	[si.HBA_PRDT_ENTRY.rsv0],eax
+	; And the size
+	mov	eax,[bx.EDD_Region.EDD_physsize]
+	btr	eax,1Fh	; disable interrupts
+	mov	[si.HBA_PRDT_ENTRY.dbc],eax
+
+	; Next please...
+	add	bx,size EDD_Region
+	add	si,size HBA_PRDT_ENTRY
+	loop	@B
+
+	; Successfully locked, set the flag!
+	bts	word ptr [bp.ahcidrv_stack.bFlags],EBIT_PRDT_EDDS_LOCKED
+	; Return success, with the number of entries in CX
+	pop	cx
+	xor	ah,ah
+	ret
+FixupPRDT	endp
+
+; This function redirects the return of "stop_cmd" to UnlockAll, below,
+; by intercepting a call to "wait_cr_unset".
+stop_cmd_redir	proc near
+	pop	ax
 	call	@F
 @@:
-	pop	di
-	; get (non-constant) address of end_stage3 into DI
-	add	di,(end_stage3 - @B)
+	pop	bx			; get address of @@ in BX
+	add	bx,UnlockAll - @B	; get address of UnlockAll in BX
+	push	bx			; put it on the stack
+	push	ax			; put our return address on the stack
+	mov	ax,wait_cr_unset
+	jmp	ax			; jump to the original function
+	; now wait_cr_unset will return to stop_cmd as expected,
+	; then stop_cmd will return to UnlockAll below!
+stop_cmd_redir	endp
 
-	; Iterate through EMS pages and figure out if buffer is in any of them
-	mov	ecx,eax
-	shr	ecx,4	; get the segment
+; Unlock all the DMA regions once the command is complete.
+; Note that Intel's AHCI firmware (for hard drives) unlocks immediately after
+; locking, and only uses VDS to get physical addresses. That would certainly be
+; easier to do here as well, but a bit risky. In the case of the firmware, the
+; regions don't really need to be locked since they are all used within a single
+; int 13h call, so no sane OS would swap out those pages while that's going on.
+; For a CD driver though, in theory an OS could decide to swap out pages while a
+; transaction is ongoing, since technically CD and HDD I/O are not mutually
+; exclusive!
+UnlockAll	proc near
+	push	di
+	push	dx
+	push	es
+	push	eax
+
+	push	cs
+	pop	es
+
+	btr	word ptr [bp.ahcidrv_stack.bFlags],EBIT_FIS_DDS_LOCKED
+	jnc	@F
+
+	mov	ax,8104h; UNLOCK DMA REGION
+	xor	dx,dx	; no flags
+	mov	di,ds:[pCmdTable]
+	add	di,CmdTbl_plus_VDS.FIS_DDS
+	int	4Bh
 
 @@:
-	cmp	dword ptr [di],-1
-	je	@@done
-	cmp	cx,[di]	; is the buffer after the start of this page?
-	jb	@@next	; nope, check next one
+	btr	word ptr [bp.ahcidrv_stack.bFlags],EBIT_CL_DDS_LOCKED
+	jnc	@F
 
-	mov	bx,cx
-	sub	bx,[di]
-	cmp	bx,400h	; is the buffer before the end of this page?
-	jnb	@@next	; nope, check next one
+	mov	ax,8104h; UNLOCK DMA REGION
+	xor	dx,dx	; no flags
+	mov	di,ds:[pCmdTable]
+	add	di,CmdTbl_plus_VDS.CmdList_DDS
+	int	4Bh
 
-	mov	bx,ax
-	and	bx,0FFFh; offset in page
-	shr	ecx,8	; turn segment into page index
-	mov	ax,0DE06h; get physical address of 4K Page
-	int	67h
+@@:
+	btr	word ptr [bp.ahcidrv_stack.bFlags],EBIT_CTBL_DDS_LOCKED
+	jnc	@F
 
-	test	ah,ah
-	jz	@@success
+	mov	ax,8104h; UNLOCK DMA REGION
+	xor	dx,dx	; no flags
+	mov	di,ds:[pCmdTable]
+	add	di,CmdTbl_plus_VDS.CmdTbl_DDS
+	int	4Bh
 
-	; uh-oh, VCPI couldn't tell us the physical page addx!
-	; just reconstruct the linear one and hope for the best...
-	movzx	eax,cx
-	shl	eax,12
-	or	ax,bx
-	jmp	@@done
+@@:
+	btr	word ptr [bp.ahcidrv_stack.bFlags],EBIT_PRDT_EDDS_LOCKED
+	jnc	@F
 
-@@next:
-	add	di,4
-	jmp	@B
+	mov	ax,8106h; SCATTER/GATHER UNLOCK REGION
+	xor	dx,dx	; no flags
+	mov	di,ds:[pCmdTable]
+	add	di,CmdTbl_plus_VDS.PRDT_EDDS
+	int	4Bh
 
-@@success:
-	; EDX = beginning of physical page
-	mov	eax,edx
-	; BX = offset
-	or	ax,bx
-	; Now EAX = physical addx of buffer
-	; TODO: What about buffers on non-contiguous pages??
+@@:
+	pop	eax
+	pop	es
+	pop	dx
+	pop	di
 
-@@done:
-	mov	[si],eax
+	; set CF as appropriate for return from stop_cmd
+	cmp	ah,1
+	cmc
 	ret
-CheckEmSeg	endp
+UnlockAll	endp
+
+; Check if VDS is available: sets CF if yes, clears it if no
+Check_VDS	proc near	uses es
+	push	BDA_SEGMENT
+	pop	es
+	assume	es:nothing
+	bt	word ptr es:[VDS_FLAG_OFFSET], 5
+	ret
+Check_VDS	endp
 endif
 
 align	4
